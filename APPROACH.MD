@@ -13,6 +13,15 @@ Build a wallet-to-wallet transfer service that is:
 
 ## Schema Design
 
+### Prerequisites
+
+The schema uses `gen_random_uuid()` from Postgres' `pgcrypto` extension.
+The first migration must enable it:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+```
+
 ### `wallets`
 
 ```sql
@@ -144,7 +153,13 @@ A duplicate request arriving now hits the unique constraint, fetches the existin
 **Phase 2 — execute business logic:**
 ```sql
 BEGIN;
-  SELECT * FROM wallets WHERE id IN ($1, $2) ORDER BY id FOR UPDATE;
+  -- application sorts the two wallet IDs and locks them with two separate
+  -- statements in deterministic order. A single IN(...) + ORDER BY query
+  -- does not guarantee lock acquisition order in Postgres (the executor
+  -- may scan and lock rows in plan-dependent order before sorting), so
+  -- two explicit statements are required.
+  SELECT * FROM wallets WHERE id = $lower_id  FOR UPDATE;
+  SELECT * FROM wallets WHERE id = $higher_id FOR UPDATE;
   -- check balance
   -- if insufficient:
   --   UPDATE transfers SET status = 'FAILED', failure_reason = $1, updated_at = now() WHERE id = $2;
@@ -188,12 +203,15 @@ Transfer execution runs in two committed transactions (see Idempotency section):
 
 **Phase 2** — business logic transaction:
 1. Sort the two wallet IDs lexicographically (lower ID first)
-2. `SELECT ... FROM wallets WHERE id IN ($1, $2) ORDER BY id FOR UPDATE`
-3. Read balances from the locked rows
-4. Check that `from_wallet` has sufficient funds
-5. If sufficient: INSERT ledger entries × 2, UPDATE balances × 2, UPDATE transfer → PROCESSED
-6. If insufficient: UPDATE transfer → FAILED
-7. Commit
+2. Lock the lower-ID wallet: `SELECT * FROM wallets WHERE id = $lower FOR UPDATE`
+3. Lock the higher-ID wallet: `SELECT * FROM wallets WHERE id = $higher FOR UPDATE`
+   *(Two separate statements — a single `IN (...) ORDER BY id FOR UPDATE` does
+   not guarantee lock acquisition order in Postgres.)*
+4. Read balances from the locked rows
+5. Check that `from_wallet` has sufficient funds
+6. If sufficient: INSERT ledger entries × 2, UPDATE balances × 2, UPDATE transfer → PROCESSED
+7. If insufficient: UPDATE transfer → FAILED
+8. Commit
 
 ### Why lock ordering prevents deadlocks
 
@@ -281,8 +299,28 @@ Response `amount` mirrors the request format — a JSON number — for symmetry.
 
 **Error responses:**
 - `400` — malformed request (missing fields, non-positive amount, same source and destination)
-- `422` — insufficient funds
 - `404` — wallet not found
+
+**Insufficient funds is NOT an error response.** It returns `201 Created` (or `200 OK` on duplicate)
+with a transfer resource whose `status` is `FAILED` and `failure_reason` is `"insufficient funds"`.
+Rationale: the transfer was successfully created, persisted, and audited — the request itself
+was valid. Only the business outcome was unfavourable. Treating it as a 4xx would conflict with
+the audit-trail design (FAILED rows are deliberately committed) and would force retries to
+re-discover the same outcome via a different response shape.
+
+Example FAILED response:
+```json
+{
+  "id": "uuid",
+  "idempotencyKey": "abc123",
+  "fromWalletId": "wallet_1",
+  "toWalletId": "wallet_2",
+  "amount": 100,
+  "status": "FAILED",
+  "failureReason": "insufficient funds",
+  "createdAt": "2026-05-18T10:00:00Z"
+}
+```
 
 **Duplicate key behaviour:**
 Any request reusing an existing `idempotencyKey` returns `200 OK` with the original transfer
