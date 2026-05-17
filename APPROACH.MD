@@ -202,11 +202,17 @@ Without consistent ordering, two concurrent transfers in opposite directions dea
 ```
 T1: wallet_A → wallet_B  — locks A, waits for B
 T2: wallet_B → wallet_A  — locks B, waits for A
-Both wait forever — DEADLOCK
+→ deadlock cycle
 ```
 
-Sorting by wallet ID before locking means both transactions always acquire locks in the same order,
-so the second one simply waits for the first to commit. No deadlock, no retry needed.
+Postgres has a deadlock detector that breaks the cycle by aborting one of the
+transactions with a `40P01` (deadlock_detected) error — the loser must retry.
+The system stays live, but retries waste work, add latency, and complicate the
+application code with retry loops.
+
+Sorting wallet IDs before locking means both transactions always acquire locks in the same order,
+so the second one simply waits for the first to commit. The deadlock cycle never forms,
+no transaction is aborted, and no retry logic is needed.
 
 ### Why pessimistic locking over optimistic locking
 
@@ -325,7 +331,7 @@ The audit trail must be complete even for failed attempts.
 - Happy path: transfer executes, two ledger entries created, balances updated correctly
 - Insufficient funds: transfer marked FAILED, no ledger entries, balances unchanged
 - Idempotency: same key sent twice returns identical response, only one transfer row in DB
-- Conflicting idempotency key: same key, different body → 409
+- Idempotency mid-flight: a duplicate request arriving while the original is still PENDING returns the PENDING transfer without triggering Phase 2 a second time
 - Ledger balance invariant: `SUM(ledger_entries.amount WHERE type=CREDIT) = SUM(... WHERE type=DEBIT)` across all entries for a transfer
 - Ledger ↔ balance consistency: `SUM(CASE WHEN type='CREDIT' THEN amount ELSE -amount END) per wallet` matches `wallets.balance`
 
