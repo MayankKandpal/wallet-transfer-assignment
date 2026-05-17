@@ -26,7 +26,9 @@ CREATE TABLE wallets (
 
 `balance` is a cached running total updated inside the same transaction as every ledger write.
 This gives O(1) balance reads. Correctness is verifiable at any time by comparing
-`SUM(ledger_entries.amount WHERE wallet_id = X)` against `wallets.balance`.
+`SUM(CASE WHEN type='CREDIT' THEN amount ELSE -amount END) WHERE wallet_id = X`
+against `wallets.balance`. A plain `SUM(amount)` would overstate the balance because
+both DEBIT and CREDIT amounts are stored as positive numbers — direction is encoded in `type`.
 
 ### `transfers`
 
@@ -43,6 +45,9 @@ CREATE TABLE transfers (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- updated_at is not maintained by a DB trigger; the application sets it explicitly
+-- on every status transition (PENDING → PROCESSED / PENDING → FAILED).
 ```
 
 `idempotency_key` has a `UNIQUE` constraint directly on the transfers table.
@@ -57,12 +62,16 @@ CREATE TABLE ledger_entries (
   wallet_id    TEXT        NOT NULL REFERENCES wallets(id),
   type         TEXT        NOT NULL CHECK (type IN ('DEBIT','CREDIT')),
   amount       NUMERIC(18,2) NOT NULL CHECK (amount > 0),
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  CONSTRAINT unique_entry_per_transfer_type UNIQUE (transfer_id, type)
 );
 ```
 
 Every transfer produces exactly two rows: one DEBIT from the source wallet, one CREDIT to the destination wallet.
 Amount is always stored as a positive number; the `type` column encodes direction.
+The `UNIQUE(transfer_id, type)` constraint enforces the two-entry invariant at the database level —
+it is impossible to accidentally insert a second DEBIT or CREDIT for the same transfer.
 
 ### Why no separate `idempotency_records` table
 
@@ -97,11 +106,35 @@ the other receives a constraint violation and falls through to return the existi
 
 Layer 1 reduces unnecessary DB round-trips. Layer 3 is the correctness guarantee.
 
-### How duplicate side effects are prevented
+### How duplicate side effects are prevented — two-phase execution
 
-Because the `idempotency_key` INSERT and all business writes (ledger entries, balance updates)
-happen inside a single transaction, a duplicate request that loses the constraint race
-never sees any partial state — the transaction that won either commits fully or rolls back fully.
+A single transaction cannot both claim the idempotency key (and survive a crash) and run
+business logic atomically. Instead, execution is split into two committed transactions:
+
+**Phase 1 — claim the key:**
+```
+BEGIN
+  INSERT INTO transfers (idempotency_key, status='PENDING', ...)
+  -- unique constraint fires here if duplicate key
+COMMIT
+```
+The PENDING row is committed immediately. The idempotency key is now owned.
+If the process crashes after Phase 1, a PENDING row is visible to a reconciliation job.
+A duplicate request arriving now hits the unique constraint, fetches the existing row, and returns it.
+
+**Phase 2 — execute business logic:**
+```
+BEGIN
+  SELECT ... FROM wallets WHERE id IN ($1,$2) ORDER BY id FOR UPDATE
+  -- check balance
+  -- if insufficient: UPDATE transfers SET status='FAILED', updated_at=now()
+  -- if sufficient:   INSERT ledger_entries ×2
+  --                  UPDATE wallets.balance ×2
+  --                  UPDATE transfers SET status='PROCESSED', updated_at=now()
+COMMIT
+```
+If Phase 2 crashes, the PENDING row remains and business side effects are fully rolled back —
+no ledger entries, no balance changes. The reconciliation job marks stale PENDING rows FAILED.
 
 ---
 
@@ -109,14 +142,18 @@ never sees any partial state — the transaction that won either commits fully o
 
 ### Approach: pessimistic row-level locking (`SELECT FOR UPDATE`)
 
-When a transfer executes:
+Transfer execution runs in two committed transactions (see Idempotency section):
 
+**Phase 1** — INSERT transfer(PENDING) and commit (claims the idempotency key).
+
+**Phase 2** — business logic transaction:
 1. Sort the two wallet IDs lexicographically (lower ID first)
 2. `SELECT ... FROM wallets WHERE id IN ($1, $2) ORDER BY id FOR UPDATE`
 3. Read balances from the locked rows
 4. Check that `from_wallet` has sufficient funds
-5. Write ledger entries and update balances
-6. Commit
+5. If sufficient: INSERT ledger entries × 2, UPDATE balances × 2, UPDATE transfer → PROCESSED
+6. If insufficient: UPDATE transfer → FAILED
+7. Commit
 
 ### Why lock ordering prevents deadlocks
 
@@ -174,12 +211,12 @@ Reversal is a separate transfer, not a state change.
   "idempotencyKey": "abc123",
   "fromWalletId": "wallet_1",
   "toWalletId": "wallet_2",
-  "amount": "100.00"
+  "amount": 100
 }
 ```
 
-`amount` is sent as a string to avoid float64 precision loss at the JSON boundary.
-Parsed with exact decimal arithmetic on the server.
+`amount` is a JSON number, decoded via `json.Number` (not `float64`) to avoid precision loss.
+Parsed into exact decimal arithmetic on the server before any computation.
 
 **Response (201 Created or 200 OK on duplicate key):**
 ```json
@@ -218,7 +255,7 @@ Returns a single transfer with its ledger entries.
 
 | Scenario | Behaviour |
 |---|---|
-| Insufficient funds | INSERT transfer(FAILED, failure_reason), no ledger entries, COMMIT |
+| Insufficient funds | Phase 1 commits PENDING; Phase 2 transitions to FAILED, no ledger entries written, COMMIT |
 | Same source and destination | Rejected at validation, no DB write |
 | Non-positive amount | Rejected at validation, no DB write |
 | Duplicate idempotency key (same body) | Return original result, no second transfer |
@@ -247,7 +284,7 @@ The audit trail must be complete even for failed attempts.
 - Idempotency: same key sent twice returns identical response, only one transfer row in DB
 - Conflicting idempotency key: same key, different body → 409
 - Ledger balance invariant: `SUM(ledger_entries.amount WHERE type=CREDIT) = SUM(... WHERE type=DEBIT)` across all entries for a transfer
-- Ledger ↔ balance consistency: `SUM(ledger_entries.amount per wallet)` matches `wallets.balance`
+- Ledger ↔ balance consistency: `SUM(CASE WHEN type='CREDIT' THEN amount ELSE -amount END) per wallet` matches `wallets.balance`
 
 ### Concurrency test
 
