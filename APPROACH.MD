@@ -70,15 +70,28 @@ CREATE TABLE ledger_entries (
 
 Every transfer produces exactly two rows: one DEBIT from the source wallet, one CREDIT to the destination wallet.
 Amount is always stored as a positive number; the `type` column encodes direction.
-The `UNIQUE(transfer_id, type)` constraint enforces the two-entry invariant at the database level —
-it is impossible to accidentally insert a second DEBIT or CREDIT for the same transfer.
+
+**Enforcing exactly two entries** requires two complementary guarantees:
+
+- *No more than two per transfer:* the `UNIQUE(transfer_id, type)` constraint enforces this at the database level —
+  it is impossible to insert a second DEBIT or CREDIT for the same transfer.
+- *No fewer than two per transfer:* both ledger inserts and the transfer's transition to `PROCESSED`
+  happen inside the same Phase 2 transaction. Either both rows commit together with the status
+  update, or the entire transaction rolls back and the transfer remains in `PENDING`.
+  A `PROCESSED` transfer therefore always has exactly two ledger entries.
+
+A periodic reconciliation query (`SELECT COUNT(*) FROM ledger_entries GROUP BY transfer_id HAVING COUNT(*) <> 2`)
+restricted to PROCESSED transfers should always return zero rows.
 
 ### Why no separate `idempotency_records` table
 
-The `UNIQUE` constraint on `transfers.idempotency_key` is sufficient.
-A separate idempotency table would require a two-phase write (insert idempotency record, then insert transfer)
-with its own race conditions. Colocating the key on the transfer row means the
-idempotency guarantee and the business record are created atomically in one INSERT.
+The `UNIQUE` constraint on `transfers.idempotency_key` is sufficient on its own.
+A separate idempotency table would add a second table and a foreign-key relationship
+without buying any guarantee that the column-level unique constraint does not already provide.
+
+The idempotency key has exactly the same lifecycle as the transfer it identifies —
+created with it, kept forever with it, never updated. Co-locating the key on the
+transfer row keeps the schema minimal and lets a single DB constraint enforce uniqueness.
 
 ---
 
@@ -108,33 +121,60 @@ Layer 1 reduces unnecessary DB round-trips. Layer 3 is the correctness guarantee
 
 ### How duplicate side effects are prevented — two-phase execution
 
-A single transaction cannot both claim the idempotency key (and survive a crash) and run
-business logic atomically. Instead, execution is split into two committed transactions:
+**The tradeoff:** wrapping the idempotency-key INSERT and all business writes in a single
+transaction would be simpler, but a process crash mid-execution rolls back the PENDING row
+along with everything else — leaving no trace of an in-flight transfer. Future retries would
+have no way to distinguish "never attempted" from "attempted, status unknown".
+
+To get a crash-visible PENDING record while still keeping business writes atomic, execution
+is split into two committed transactions:
 
 **Phase 1 — claim the key:**
-```
-BEGIN
-  INSERT INTO transfers (idempotency_key, status='PENDING', ...)
-  -- unique constraint fires here if duplicate key
-COMMIT
+```sql
+BEGIN;
+  INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, status)
+  VALUES (gen_random_uuid(), $1, $2, $3, $4, 'PENDING');
+  -- unique constraint on idempotency_key fires here if duplicate
+COMMIT;
 ```
 The PENDING row is committed immediately. The idempotency key is now owned.
 If the process crashes after Phase 1, a PENDING row is visible to a reconciliation job.
-A duplicate request arriving now hits the unique constraint, fetches the existing row, and returns it.
+A duplicate request arriving now hits the unique constraint, fetches the existing row, and returns its current state (see below).
 
 **Phase 2 — execute business logic:**
-```
-BEGIN
-  SELECT ... FROM wallets WHERE id IN ($1,$2) ORDER BY id FOR UPDATE
+```sql
+BEGIN;
+  SELECT * FROM wallets WHERE id IN ($1, $2) ORDER BY id FOR UPDATE;
   -- check balance
-  -- if insufficient: UPDATE transfers SET status='FAILED', updated_at=now()
-  -- if sufficient:   INSERT ledger_entries ×2
-  --                  UPDATE wallets.balance ×2
-  --                  UPDATE transfers SET status='PROCESSED', updated_at=now()
-COMMIT
+  -- if insufficient:
+  --   UPDATE transfers SET status = 'FAILED', failure_reason = $1, updated_at = now() WHERE id = $2;
+  -- if sufficient:
+  --   INSERT INTO ledger_entries (transfer_id, wallet_id, type, amount) VALUES (..., 'DEBIT', ...);
+  --   INSERT INTO ledger_entries (transfer_id, wallet_id, type, amount) VALUES (..., 'CREDIT', ...);
+  --   UPDATE wallets SET balance = balance - $amount WHERE id = $from_id;
+  --   UPDATE wallets SET balance = balance + $amount WHERE id = $to_id;
+  --   UPDATE transfers SET status = 'PROCESSED', updated_at = now() WHERE id = $id;
+COMMIT;
 ```
 If Phase 2 crashes, the PENDING row remains and business side effects are fully rolled back —
 no ledger entries, no balance changes. The reconciliation job marks stale PENDING rows FAILED.
+
+### Duplicate requests against an in-flight transfer
+
+A duplicate request can arrive while the original is still in `PENDING` (Phase 2 has not yet committed).
+The handler always returns the current persisted state of the transfer; it does not block, retry,
+or wait for Phase 2 to finish.
+
+| Original transfer state when duplicate arrives | Response |
+|---|---|
+| PENDING | `200 OK` with `status: PENDING` — client should poll `GET /transfers/:id` until terminal |
+| PROCESSED | `200 OK` with `status: PROCESSED` — final response |
+| FAILED | `200 OK` with `status: FAILED` and `failure_reason` — final response |
+
+This keeps the idempotency contract simple — duplicates never trigger side effects, regardless of timing —
+and pushes the polling responsibility to the client, which is the only party that knows how long it is willing to wait.
+The API contract example below shows the `PROCESSED` case because that is the steady-state response;
+in-flight responses contain the same shape with `status: PENDING`.
 
 ---
 
@@ -218,28 +258,32 @@ Reversal is a separate transfer, not a state change.
 `amount` is a JSON number, decoded via `json.Number` (not `float64`) to avoid precision loss.
 Parsed into exact decimal arithmetic on the server before any computation.
 
-**Response (201 Created or 200 OK on duplicate key):**
+**Response (201 Created on new transfer, 200 OK on duplicate key):**
 ```json
 {
   "id": "uuid",
   "idempotencyKey": "abc123",
   "fromWalletId": "wallet_1",
   "toWalletId": "wallet_2",
-  "amount": "100.00",
+  "amount": 100,
   "status": "PROCESSED",
-  "createdAt": "2026-05-17T10:00:00Z"
+  "createdAt": "2026-05-18T10:00:00Z"
 }
 ```
 
+Response `amount` mirrors the request format — a JSON number — for symmetry.
+
 **Error responses:**
 - `400` — malformed request (missing fields, non-positive amount, same source and destination)
-- `409` — idempotency key conflict with different request body (same key, different wallets/amount)
 - `422` — insufficient funds
 - `404` — wallet not found
 
 **Duplicate key behaviour:**
-- Same key + same body → `200 OK` with original response
-- Same key + different body → `409 Conflict`
+Any request reusing an existing `idempotencyKey` returns `200 OK` with the original transfer
+(in its current state — PENDING, PROCESSED, or FAILED). The request body of the duplicate
+is not validated against the original; the key alone identifies the transfer. This matches
+the assignment's contract ("return the original result") and avoids the overhead of storing
+or hashing request bodies for comparison.
 
 ### GET /wallets/:id/balance *(optional)*
 
@@ -258,8 +302,7 @@ Returns a single transfer with its ledger entries.
 | Insufficient funds | Phase 1 commits PENDING; Phase 2 transitions to FAILED, no ledger entries written, COMMIT |
 | Same source and destination | Rejected at validation, no DB write |
 | Non-positive amount | Rejected at validation, no DB write |
-| Duplicate idempotency key (same body) | Return original result, no second transfer |
-| Duplicate idempotency key (different body) | 409 Conflict |
+| Duplicate idempotency key | Return existing transfer in its current state; no second transfer created. Body of duplicate is not compared against the original. |
 | Process crash mid-transfer | PENDING row left; balance unchanged (no ledger written yet); safe to retry |
 | Wallet not found | 404, no DB write |
 
@@ -303,7 +346,7 @@ The audit trail must be complete even for failed attempts.
 | Cached balance on `wallets` | O(1) reads; correctness verifiable by comparing to ledger SUM at any time |
 | Pessimistic locking | Predictable latency under contention; no retry loops |
 | Lock ordering by wallet ID | Prevents deadlocks without needing serializable isolation |
-| Amount as string in API | Avoids float64 precision loss at the JSON boundary |
+| Amount as JSON number, decoded via `json.Number` | Matches the assignment's request example; `json.Number` preserves precision (unlike `float64`) before conversion to decimal |
 | FAILED transfers are committed (not rolled back) | Audit trail must include failed attempts |
 | No authentication | Out of scope for this assignment |
 | No reversal API | Not in functional requirements; can be added as a subsequent transfer if needed |
