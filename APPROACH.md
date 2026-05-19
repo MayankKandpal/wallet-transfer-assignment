@@ -141,6 +141,19 @@ is split into two committed transactions:
 **Phase 1 — claim the key:**
 ```sql
 BEGIN;
+  -- Lock BOTH wallet rows in sorted id order first. The INSERT below performs
+  -- foreign-key checks on from_wallet_id and to_wallet_id, and Postgres takes
+  -- an implicit row-share lock on each referenced wallet row in column
+  -- (from, then to) evaluation order — NOT sorted order. For an opposing
+  -- transfer (B -> A) that order is reversed, and it can interleave with a
+  -- concurrent Phase 2 FOR UPDATE to form a deadlock cycle
+  -- (observed: SQLSTATE 40P01 at the INSERT). Pre-locking the two wallet rows
+  -- in the same global sorted order used by Phase 2 makes every transaction
+  -- acquire wallet locks in one consistent order, so no cycle can form. The
+  -- existence check here also gives the 404 (with no row written, since the
+  -- transaction rolls back) before the key is claimed.
+  SELECT id FROM wallets WHERE id = $lower_id  FOR UPDATE;
+  SELECT id FROM wallets WHERE id = $higher_id FOR UPDATE;
   INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, status)
   VALUES (gen_random_uuid(), $1, $2, $3, $4, 'PENDING');
   -- unique constraint on idempotency_key fires here if duplicate
@@ -149,6 +162,13 @@ COMMIT;
 The PENDING row is committed immediately. The idempotency key is now owned.
 If the process crashes after Phase 1, a PENDING row is visible to a reconciliation job.
 A duplicate request arriving now hits the unique constraint, fetches the existing row, and returns its current state (see below).
+
+> **Lock-ordering invariant:** *every* transaction that touches the two wallet
+> rows — Phase 1 (FK-induced locks, made deterministic by the pre-locks above)
+> and Phase 2 (`FOR UPDATE`) — acquires them in the same sorted (lower id
+> first) order and holds them until its own commit. Ordered locking across all
+> transactions makes the wait-for graph acyclic, so the system is deadlock-free
+> even under opposing concurrent transfers.
 
 **Phase 2 — execute business logic:**
 ```sql
@@ -199,7 +219,13 @@ in-flight responses contain the same shape with `status: PENDING`.
 
 Transfer execution runs in two committed transactions (see Idempotency section):
 
-**Phase 1** — INSERT transfer(PENDING) and commit (claims the idempotency key).
+**Phase 1** — lock both wallet rows `FOR UPDATE` in sorted id order, then
+INSERT transfer(PENDING) and commit (claims the idempotency key). The pre-lock
+is required because the FK checks in the INSERT take implicit row-share locks
+on both wallet rows in unsorted (column) order; pre-locking in sorted order
+keeps the global lock ordering consistent with Phase 2 (see Idempotency →
+Lock-ordering invariant). It also yields a no-DB-write 404 when a wallet is
+missing, since the transaction rolls back before the row is inserted.
 
 **Phase 2** — business logic transaction:
 1. Sort the two wallet IDs lexicographically (lower ID first)
